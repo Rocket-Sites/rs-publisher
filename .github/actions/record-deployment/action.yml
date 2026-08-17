@@ -1,0 +1,56 @@
+name: Record the proved address as a GitHub Deployment
+description: |
+  Create a GitHub Deployment on the CALLER'S OWN repository whose
+  `environment_url` is the origin this run resolved and proved, so a client
+  site's published address outlives the run's log (ARCHITECTURE.md invariant 12).
+
+  Written with the caller's own GITHUB_TOKEN, which needs `deployments: write` in
+  the caller workflow's `permissions:` block -- the publish job has asked for it
+  since the publisher's first release. No Rocket Lab credential is involved, and
+  none may be: the Rocket Sites App only ever READS this back.
+
+  Runs after the post-deploy proof and only on success(). A Deployment outlives
+  the run that wrote it, so an unproven one would be a confident wrong answer
+  with a permanent record behind it.
+
+  Never fails the run. A caller whose default workflow-token permissions are
+  read-only cannot write a Deployment, the publisher cannot see that in advance,
+  and the site is already deployed and proven by this point. The address is
+  published as a step name as well, which is what the console falls back to.
+
+inputs:
+  address:
+    description: The https origin this run resolved and proved. Empty records nothing.
+    required: true
+  repo:
+    description: owner/repo of the caller, from github.repository
+    required: true
+  run-id:
+    description: |
+      github.run_id. Written into the deployment payload: the console only trusts
+      an address from a run GitHub reports as having called this publisher, so
+      the record has to name that run.
+    required: true
+  run-sha:
+    description: The commit that was published, from github.sha
+    required: true
+  github-token:
+    description: |
+      The CALLER's GITHUB_TOKEN (github.token), needing `deployments: write`.
+      Never an App installation token: that would put a Rocket Lab credential in
+      an agency's deploy path and would keep the App at `deployments: write`
+      when it only needs `read`.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - id: record
+      shell: bash
+      env:
+        SITE_ADDRESS: ${{ inputs.address }}
+        REPO: ${{ inputs.repo }}
+        RUN_ID: ${{ inputs.run-id }}
+        RUN_SHA: ${{ inputs.run-sha }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: node "${{ github.action_path }}/record-deployment.mjs"

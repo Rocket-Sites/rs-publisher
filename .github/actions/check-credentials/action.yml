@@ -1,0 +1,30 @@
+name: Cloudflare credential pre-flight
+description: |
+  Prove the Cloudflare credentials arrived and reach the account before anything
+  has a side effect. In gated mode a token that cannot reach Access is fatal --
+  the gate cannot be built, so the site must not publish. In public mode it is a
+  warning, because the only thing Access is needed for is removing a leftover
+  gate, and the post-deploy check is the backstop for that.
+
+inputs:
+  mode:
+    description: public | gated
+    required: true
+  cf-api-token:
+    description: Cloudflare API token
+    required: false
+    default: ""
+  cf-account-id:
+    description: Cloudflare account id
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cf-api-token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cf-account-id }}
+      run: node "${{ github.action_path }}/check-credentials.mjs"
