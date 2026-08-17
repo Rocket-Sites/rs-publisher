@@ -1,0 +1,68 @@
+name: Stamp the site's own URL
+description: |
+  Write the real serving origin into every published page's canonical, og:url
+  and absolute og:image, emit robots.txt and sitemap.xml for the publication
+  mode, then guard the result.
+
+  Runs after the Pages project exists, because the canonical host is the
+  project's real subdomain or a custom domain attached to it, and neither is
+  knowable before that. Runs before the upload, so a site that cannot be given a
+  correct canonical is never served to anybody.
+
+  The publisher DISCOVERS custom domains and never attaches one: an agency
+  frequently does not hold the client's registrar zone, and a half-attached
+  domain resolves for nobody while CI reports green.
+
+inputs:
+  mode:
+    description: public | gated. Decides the crawl posture written into robots.txt.
+    required: true
+  project-name:
+    description: Cloudflare Pages project name
+    required: true
+  publish-dir:
+    description: The assembled upload directory
+    required: false
+    default: "_site"
+  custom-domain:
+    description: |
+      Optional. The one hostname this site is canonically served at. Discovery
+      still runs, and a declaration the Pages project contradicts fails the run.
+    required: false
+    default: ""
+  cf-api-token:
+    description: Cloudflare API token
+    required: true
+  cf-account-id:
+    description: Cloudflare account id
+    required: true
+
+outputs:
+  canonical-origin:
+    description: The https origin stamped into every page
+    value: ${{ steps.stamp.outputs.canonical-origin }}
+  serving-domains:
+    description: Comma separated list of every host this project answers on
+    value: ${{ steps.stamp.outputs.serving-domains }}
+
+runs:
+  using: composite
+  steps:
+    - id: stamp
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        PROJECT_NAME: ${{ inputs.project-name }}
+        PUBLISH_DIR: ${{ inputs.publish-dir }}
+        CUSTOM_DOMAIN: ${{ inputs.custom-domain }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cf-api-token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cf-account-id }}
+      run: node "${{ github.action_path }}/stamp-site-url.mjs"
+
+    # A separate process re-reading the artifact from disk. A rewriter that
+    # checks its own output only proves it did what it thinks it did.
+    - shell: bash
+      env:
+        PUBLISH_DIR: ${{ inputs.publish-dir }}
+        SITE_ORIGIN: ${{ steps.stamp.outputs.canonical-origin }}
+      run: node "${{ github.action_path }}/guard-site-url.mjs"
