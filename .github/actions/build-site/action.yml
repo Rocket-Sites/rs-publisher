@@ -1,0 +1,208 @@
+name: Build the publishable site
+description: |
+  Assemble the upload directory, compile Tailwind to a purged styles.css, stamp
+  the recognition meta into every page, and then guard the ARTIFACT.
+
+  All of it runs before the Pages project is touched. A site that fails a guard
+  must fail before anything is live, not after a broken artifact is serving to a
+  client's customers.
+
+inputs:
+  site-dir:
+    description: Directory holding the site source (HTML + assets)
+    required: false
+    default: "."
+  publish-dir:
+    description: Directory assembled for upload
+    required: false
+    default: "_site"
+  repo:
+    description: owner/repo being published, stamped into every page
+    required: true
+  tailwind-version:
+    description: |
+      Exact Tailwind CLI version. Pinned rather than floating, so a Tailwind
+      release cannot silently change every agency's published CSS on a Tuesday.
+
+      Tailwind 4, and the package is `@tailwindcss/cli`: v4 moved the CLI out of
+      the `tailwindcss` package. The major matters for a reason beyond styling
+      (issue #167). v3 does not parse `tailwind.config.cjs`, it `require`s it, so
+      building a client's site executed code out of the client's repository. v4's
+      theme is CSS-first and there is no config module to execute; the brand
+      tokens come out of `rocket-site.json` as data, and this action composes the
+      `@theme` block from them.
+    required: false
+    default: "4.3.3"
+
+runs:
+  using: composite
+  steps:
+    # Assemble the bytes that will be uploaded. Everything the client's visitors
+    # have no business receiving is left behind here: repo plumbing, the Tailwind
+    # INPUT file (styles.css is the output), the per-site config the extension
+    # reads over the GitHub API, and template-authoring files.
+    #
+    # Patterns are written to catch the EXTENSION VARIANTS, not one spelling.
+    # `tailwind.config.js` was excluded while every shipped template actually
+    # carries `tailwind.config.cjs`, so the config was being published to client
+    # sites -- harmless in effect, and exactly the near-miss this deny-list
+    # exists to prevent. Same reasoning for lockfiles and dotfiles below.
+    # `/preview.png` is anchored to the site root: it is the template gallery
+    # image, and an unanchored pattern would silently drop a client's own
+    # assets/preview.png.
+    #
+    # ── The Cloudflare Pages control entries (issues #121 and #234) ──────
+    #
+    # `_worker.js`, `functions`, `_routes.json`, `_headers` and `_redirects` are
+    # interpreted by Pages FROM THE UPLOADED DIRECTORY, at its root. Until this
+    # list mentioned them, any of them sitting in a client's site repo shipped,
+    # unremarked, and nothing in the publisher knew they existed.
+    #
+    # `_worker.js` turns the project into a Worker-backed site: arbitrary
+    # server-side code in front of a client's marketing site, which is precisely
+    # what ARCHITECTURE.md rules out when it reasons about a per-host robots.txt.
+    # A `functions` DIRECTORY is the other way to the same Worker -- `wrangler
+    # pages deploy` compiles it into one -- and it arrives the ordinary way,
+    # from a Pages tutorial or an assistant adding a form handler, because from
+    # the repo it looks like one more folder. `_headers` rewrites the security
+    # headers. `_redirects` sends the client's traffic anywhere -- including one
+    # line that made an ungated project answer `302 -> /cdn-cgi/access/login/...`
+    # and FORGE THE GATE PROOF.
+    #
+    # NAMES, NOT SHAPES (#234). This list was written as five control FILES and
+    # missed `functions/` for that reason alone, so read it as the names Pages
+    # interprets at the root whatever they turn out to be. The pattern is written
+    # twice for each, without and with a trailing slash, because rsync reads a
+    # trailing `/` as "directories only" and `_worker.js` is itself a directory
+    # in Pages' advanced mode.
+    #
+    # Anchored to the root, because that is the only place Pages reads them, and
+    # a client's own `assets/_headers` is a file with a name, `assets/functions/`
+    # is a folder of assets, and `functions.html` is a page. Not directives.
+    # guard-artifact.mjs fails the publish if one arrives some other way.
+    #
+    # ── --no-links (issue #141) ──────────────────────────────────────────
+    #
+    # `-a` implies `-l`, which COPIES A SYMLINK AS A SYMLINK. A site repo
+    # containing `evil.html -> ../outside.txt` therefore put that link in the
+    # upload directory, where the stamping steps wrote THROUGH it -- prepending
+    # a meta tag and a canonical tag to a file outside the publish directory, in
+    # a job holding the agency's account-wide Cloudflare token -- while the
+    # guards read the TARGET's bytes and the upload followed the link. Worse for
+    # a link to a DIRECTORY: neither walker recursed into one, so nothing
+    # beneath it was checked by any rule, and `assets -> ../.git` would publish
+    # the repo's git objects past a deny-list that excludes `.git` by name.
+    #
+    # `--no-links` SKIPS them. NOT `--copy-links`, which resolves the link and
+    # copies the outside content in -- that publishes the file rather than
+    # refusing it, which is the wrong direction for a guard. Not `--safe-links`
+    # either: it keeps in-tree links, and "the target is inside the tree" is a
+    # property of the instant it is read, not of the bytes that get uploaded.
+    # _lib/walk.mjs refuses any link that arrives some other way.
+    - name: Assemble publish directory
+      shell: bash
+      env:
+        SITE_DIR: ${{ inputs.site-dir }}
+        PUBLISH_DIR: ${{ inputs.publish-dir }}
+      run: |
+        set -euo pipefail
+        rm -rf "$PUBLISH_DIR"
+        mkdir -p "$PUBLISH_DIR"
+        rsync -a --no-links \
+          --exclude '.git' \
+          --exclude '.gitignore' \
+          --exclude '.gitattributes' \
+          --exclude '.github' \
+          --exclude 'node_modules' \
+          --exclude "$PUBLISH_DIR" \
+          --exclude '.env' \
+          --exclude '.env.*' \
+          --exclude 'tailwind.css' \
+          --exclude 'tailwind.config.*' \
+          --exclude 'postcss.config.*' \
+          --exclude 'package.json' \
+          --exclude 'package-lock.json' \
+          --exclude 'pnpm-lock.yaml' \
+          --exclude 'yarn.lock' \
+          --exclude 'bun.lockb' \
+          --exclude 'rocket-site.json' \
+          --exclude 'template.json' \
+          --exclude '/preview.png' \
+          --exclude '/_worker.js' \
+          --exclude '/_worker.js/' \
+          --exclude '/functions' \
+          --exclude '/functions/' \
+          --exclude '/_routes.json' \
+          --exclude '/_headers' \
+          --exclude '/_redirects' \
+          --exclude '*.md' \
+          "$SITE_DIR"/ "$PUBLISH_DIR"/
+        echo "Assembled publish directory:"
+        find "$PUBLISH_DIR" -type f | sort
+
+    # Tailwind is compiled, never CDN-loaded (ARCHITECTURE.md section 1).
+    #
+    # The input is COMPOSED rather than used directly (issue #167): the template's
+    # own tailwind.css, plus an `@theme` block generated from rocket-site.json's
+    # brand tokens, plus an `@source` naming the ASSEMBLED pages -- because those
+    # are the ones that will actually be served, and purging against the source
+    # they were copied from could keep a class the artifact does not have.
+    #
+    # NOTHING IN THE SITE REPOSITORY IS EXECUTED. That is the point of the step.
+    # v4 has no config module, and the brand values are read as JSON and held to
+    # a shape before they are written into CSS. tests/publisher/
+    # build-isolation.test.mjs asserts the absence as well as the isolation.
+    #
+    # WHERE THE COMPOSED FILE LIVES IS LOAD-BEARING, and it is not obvious.
+    # Tailwind 4 resolves `@import "tailwindcss"` by walking up from the INPUT
+    # FILE looking for `node_modules` -- not from the working directory, and not
+    # from the CLI's own location. Measured: an input in the system temp
+    # directory fails with `Can't resolve 'tailwindcss' in /tmp/...` however the
+    # CLI is invoked. So the CLI is installed into a scratch directory and the
+    # composed input is written INSIDE it, where the resolution succeeds by
+    # construction. `npm install` rather than `npx` for the same reason: npx puts
+    # the package in a cache directory whose path is not ours to rely on.
+    #
+    # The scratch directory is outside the site checkout and outside the publish
+    # directory. Inside the first it would be a tree the next rsync had to know
+    # about; inside the second it would be UPLOADED to the client's site.
+    - name: Compile Tailwind
+      shell: bash
+      env:
+        SITE_DIR: ${{ inputs.site-dir }}
+        PUBLISH_DIR: ${{ inputs.publish-dir }}
+        TAILWIND_VERSION: ${{ inputs.tailwind-version }}
+      run: |
+        set -euo pipefail
+        echo "Tailwind CLI version: @tailwindcss/cli@${TAILWIND_VERSION}"
+
+        TAILWIND_HOME="$(mktemp -d)"
+        npm install --no-save --no-audit --no-fund \
+          --prefix "$TAILWIND_HOME" "@tailwindcss/cli@${TAILWIND_VERSION}"
+        test -d "${TAILWIND_HOME}/node_modules/tailwindcss" || {
+          echo "::error::@tailwindcss/cli@${TAILWIND_VERSION} did not bring tailwindcss with it, so the" \
+               "composed input cannot resolve '@import \"tailwindcss\"'."
+          exit 1
+        }
+
+        BUILD_INPUT="$(RS_TAILWIND_HOME="$TAILWIND_HOME" node "${{ github.action_path }}/compose-tailwind-input.mjs")"
+        echo "Composed build input: ${BUILD_INPUT}"
+        "${TAILWIND_HOME}/node_modules/.bin/tailwindcss" \
+          --input "$BUILD_INPUT" \
+          --output "${PUBLISH_DIR}/styles.css" \
+          --minify
+        echo "styles.css: $(wc -c < "${PUBLISH_DIR}/styles.css") bytes"
+
+    - name: Stamp the recognition meta into every page
+      shell: bash
+      env:
+        REPO: ${{ inputs.repo }}
+        PUBLISH_DIR: ${{ inputs.publish-dir }}
+      run: node "${{ github.action_path }}/inject-source-meta.mjs"
+
+    - name: Guard the artifact
+      shell: bash
+      env:
+        REPO: ${{ inputs.repo }}
+        PUBLISH_DIR: ${{ inputs.publish-dir }}
+      run: node "${{ github.action_path }}/guard-artifact.mjs"
