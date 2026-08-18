@@ -1,0 +1,822 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Rocket Sites publisher (reusable)
+#
+# Publishes a client's static marketing site to the AGENCY's Cloudflare Pages
+# account, from the AGENCY's GitHub Actions, using the AGENCY's Cloudflare
+# credentials. There is no Rocket Lab service in the path (ARCHITECTURE.md).
+#
+# ── The one thing to understand before editing this file ──────────────────
+#
+# This workflow is modelled on Glassdocs' deploy-pages.yml with the gating
+# INVERTED. Glassdocs publishes private knowledge bases and fails closed
+# everywhere; Rocket Sites publishes public client marketing websites, and a
+# careless port produces one of two unforgivable outcomes:
+#
+#   * a LIVE CLIENT SITE LOCKED, which the client is paying to be findable, or
+#   * a site the client asked to keep unlisted PUBLISHED before they said so.
+#
+# Those are not equally likely and not equally survivable, which is why `mode`
+# DEFAULTS TO `public` (ARCHITECTURE.md invariant 5): a site that goes live early
+# is visible and gets fixed, a site that is silently gated is invisible to the
+# very people meant to see it and nobody notices. The corrective actions are
+# ASYMMETRIC (invariant 6):
+#
+#   mode: public  THE DEFAULT. Launched, world-readable. No Access app; a
+#                 leftover one is removed. Proof of the desired state is HTTP 200
+#                 whose BODY carries this repo's <meta name="source-repo"> -- a
+#                 bare 200 is not proof, because Cloudflare placeholder pages,
+#                 Access error pages and stale unrelated projects all answer 200
+#                 (invariant 7). Corrective action on a proven lock is ACCESS-APP
+#                 REMOVAL. Never a rollback: the gate lives in Access
+#                 configuration, not in the deployment, so a rollback cannot
+#                 un-gate anything -- it just replaces a locked live site with a
+#                 locked live site serving yesterday's content, and it looks like
+#                 a fix.
+#   mode: gated   EXPLICIT OPT-IN, for the pre-launch client-review window.
+#                 Cloudflare Access over the apex AND *.<domain>. Proof of the
+#                 desired state is a 3xx to the Access login. Corrective action
+#                 on proven exposure is ROLLBACK, or project deletion when this
+#                 run created the project. Refused outright when the Pages
+#                 project carries a custom domain, because an Access app covers
+#                 only the hosts it names (invariant 10).
+#
+# Rollback and project deletion belong ONLY to gated. Access-app removal belongs
+# ONLY to public. If you are about to make those symmetric, don't.
+#
+# The branching logic lives in Node scripts under .github/actions/, not in
+# inline `run:` blocks, so it can be unit tested with a stubbed Cloudflare API
+# (tests/publisher/). A workflow whose safety property is inverted from its
+# reference cannot be reviewed by eye.
+#
+# ── Why this is THREE JOBS and not one (issue #148) ───────────────────────
+#
+# Building the site EXECUTES CODE OUT OF THE SITE REPOSITORY. Tailwind v3 does
+# not parse `tailwind.config.cjs`, it `require`s it: the file is a CommonJS
+# module and running it is the documented behaviour of the tool. Every
+# scaffolded site ships one, because that is where a client's brand tokens live.
+#
+# `Cloudflare Pages: Edit` is ACCOUNT-SCOPED. Re-measured 2026-08-12 against
+# Cloudflare's own permission reference: API token policies address `User`,
+# `Account` and `Zone` and nothing below them, a Pages project is not an
+# addressable resource, and the resource-scoped permissions that went GA in
+# April 2026 cover Zero Trust only. R2 can scope a token to a bucket; Pages
+# cannot scope one to a project. So there is no narrower token to hand out, and
+# the credential in ONE client's deploy can edit -- and delete -- EVERY Pages
+# project on that agency's account.
+#
+# Put those two facts in one job and write access to one client's site repo is
+# write access to every other site that agency publishes. A contractor with push
+# rights to `smith-plumbing` can redeploy `legal-eagles`, and the change reviews
+# as a styling tweak.
+#
+# SEPARATE STEPS DO NOT BREAK THAT CHAIN, and this is the part that is easy to
+# get wrong. GitHub materialises a secret only into the steps that reference it,
+# so a build step with no `secrets.` expression genuinely never sees the value in
+# its own environment -- and it does not matter, because every step in a job
+# shares one runner, one uid and one workspace. Code executing in the build step
+# can background a process that reads a later step's `/proc/<pid>/environ`,
+# append to `$GITHUB_ENV` or `$GITHUB_PATH` to shadow `node` for the deploy step,
+# or drop a `package.json`/`.npmrc` into the workspace that `npm install
+# wrangler@...` picks up with the token already in its environment. "The build
+# step holds no credential" has to be a property of the MACHINE, not of the YAML.
+#
+# So:
+#
+#   preflight  inputs and the credential pre-flight. No checkout, no site code.
+#   build      checks out the site and runs Tailwind over it. Contains NO
+#              `secrets.` expression at all, so no secret is ever placed on that
+#              runner, and it hands its output on as an ARTIFACT.
+#   publish    holds CLOUDFLARE_API_TOKEN. Never checks the site repo out, so
+#              nothing site-supplied exists on that runner to be executed. It
+#              downloads the built directory and treats it as bytes.
+#
+# The site is still built before anything on Cloudflare is touched, which is the
+# ordering the artifact guards depend on. What changed is that the guard's
+# verdict now travels between two machines instead of two steps.
+#
+# tests/publisher/build-isolation.test.mjs proves both halves: that a planted
+# `tailwind.config.cjs` really does exfiltrate a token when one is in its
+# environment, and that the job which executes it has none.
+#
+# Changing behaviour here means updating the invariants section of
+# ARCHITECTURE.md in the same commit (CLAUDE.md hard rule 5). The reconciliation
+# is enforced, not trusted: .github/actions/_lib/invariants.mjs binds each
+# numbered invariant to the code that implements it and to the test that pins it,
+# and CI fails when the three stop agreeing.
+#
+# ── This file is a RELEASED ARTIFACT ──────────────────────────────────────
+#
+# Consumers do not run what is on `main`. They run what is at the tag, in the
+# repo named by .github/publisher-release.json. Editing this file changes
+# NOTHING for any agency until the release step in .github/RELEASING.md is run.
+# That gap is silent in the direction that matters, and it is the exact way a
+# security fix to the gating logic can be authored, reviewed, merged and closed
+# while every client site keeps deploying the broken version. The drift check
+# (`cd tests && npm test`) is what makes it loud.
+#
+# ── Usage in a client site repo ───────────────────────────────────────────
+#   jobs:
+#     publish:
+#       permissions:
+#         contents: read
+#         deployments: write
+#       # Pinned to the moving major tag, never to a branch. `@main` here would
+#       # hand every agency an untested publisher the moment anything merges.
+#       uses: Rocket-Sites/rs-publisher/.github/workflows/deploy-site.yml@v1
+#       with:
+#         project-name: ${{ vars.CF_PAGES_PROJECT }}
+#         # mode: omitted == public. Add `mode: gated` (plus client-emails /
+#         # agency-domain) only for a pre-launch review, and remove all of them
+#         # together when the site goes live -- `public` with access inputs still
+#         # set is refused, on purpose.
+#         # A VARIABLE, not a secret (issue #81). The account id identifies a
+#         # Cloudflare account and authorises nothing, and as a variable it can be
+#         # read back -- which is what lets the console tell an agency which
+#         # account a client's site deploys to. The CLOUDFLARE_ACCOUNT_ID secret
+#         # below is still honoured for every caller written before this.
+#         cf-account-id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+#       # Mapped BY NAME, never `secrets: inherit` (issue #122). `inherit` lets
+#       # this workflow resolve ANY secret the calling org holds, not only the
+#       # two declared below -- and it forwards nothing at all across orgs, which
+#       # is every external agency, so it is both wider than it needs to be and
+#       # broken for its own stated use case. core/src/scaffold.ts writes this
+#       # shape into every site repo it creates.
+#       secrets:
+#         CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+#         CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+# ═══════════════════════════════════════════════════════════════════════
+
+name: Publish Rocket Site (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      project-name:
+        description: "Cloudflare Pages project name (becomes <project-name>.pages.dev)"
+        required: true
+        type: string
+      mode:
+        # DEFAULTS TO `public`, DELIBERATELY (ARCHITECTURE.md invariant 5). These
+        # are client marketing websites: being readable is what the client is
+        # paying for, and the harmful state is the gated one, because a locked
+        # site is invisible to exactly the people who would report it. Omitting
+        # this input publishes the site; restricting it is something a caller
+        # asks for in writing.
+        #
+        # The default applies to an OMITTED input, never to an empty one: a
+        # caller passing `mode: ${{ vars.SITE_MODE }}` with the variable unset
+        # supplies "" while believing it controls the mode, and validate-inputs
+        # rejects that rather than reading it as `public`.
+        #
+        # Never infer `gated` from the branch, the event, the environment, or an
+        # Access app found on the account (invariant 8). Restriction is only ever
+        # what a caller asked for.
+        description: "`public` (default: launched, world-readable) or `gated` (pre-launch client review, behind Cloudflare Access). Omit for public."
+        required: false
+        type: string
+        default: public
+      client-emails:
+        description: "Comma or newline separated client email addresses allowed through Access. Gated mode only."
+        required: false
+        type: string
+        default: ""
+      client-domain:
+        description: "One client email domain allowed through Access. Gated mode only."
+        required: false
+        type: string
+        default: ""
+      custom-domain:
+        # OPTIONAL, and public mode only. The publisher DISCOVERS the domains a
+        # Pages project answers on regardless of what is declared here; this
+        # input exists so the caller can state which one is canonical, in the
+        # diff rather than in somebody's dashboard, and so a declaration the
+        # project contradicts fails the run (invariant 11).
+        #
+        # The publisher NEVER attaches a domain and never writes a DNS record.
+        # An agency frequently does not hold the client's registrar zone, and a
+        # half-attached domain resolves for nobody while CI reports green.
+        #
+        # Refused in gated mode: a Cloudflare Access app covers only the hosts
+        # it names (invariant 10).
+        description: "Optional bare hostname the site is canonically served at, e.g. client.com. Must already be attached to the Pages project; the publisher never attaches it. Public mode only."
+        required: false
+        type: string
+        default: ""
+      agency-domain:
+        # No default value, ever. A hardcoded fallback domain silently
+        # re-broadens access to every employee of some company whenever a site
+        # deliberately sets this empty.
+        description: "The agency's own staff email domain, so the people building the site can see it. Gated mode only. Empty means no domain-level grant -- there is no fallback."
+        required: false
+        type: string
+        default: ""
+      wrangler-version:
+        # Validated in step 0 to an exact semver or empty (issue #123). It is
+        # interpolated by cloudflare/wrangler-action into
+        # `npm install wrangler@<value>`, in the job that holds the agency's
+        # Cloudflare API token -- so it is an npm specifier, and a git URL there
+        # installs arbitrary code beside the credential. A RANGE is refused as
+        # well as a URL: `^3` is not a pin, and the only reason to name a version
+        # is to get the same one twice.
+        description: "Pin an exact Wrangler version, e.g. 3.114.1 (empty = whatever the deploy action picks). A range is refused."
+        required: false
+        type: string
+        default: ""
+      cf-account-id:
+        # THE ACCOUNT ID IS NOT A CREDENTIAL, AND STORING IT AS ONE COST
+        # SOMETHING REAL (issue #81). On its own it opens nothing: Cloudflare
+        # prints it on the account overview page and in every dashboard URL. It
+        # was nevertheless kept as an Actions SECRET, for symmetry with the token
+        # beside it rather than for any property of the value -- and a GitHub
+        # secret is write-only forever. So the fleet console could never answer
+        # "which Cloudflare account does this client's site deploy to", which is
+        # ordinary fleet information an agency has nowhere else to get, and every
+        # token rotation dragged the account id along with it.
+        #
+        # As a repository VARIABLE it is readable: `GET /actions/variables`
+        # returns name and value, where `GET /actions/secrets` returns names
+        # only. That is the whole of what this input buys.
+        #
+        # AN INPUT, NOT `vars.` READ FROM HERE. A called workflow's `vars`
+        # context is the CALLER's, which happens to be what we want -- but the
+        # secrets beside it are declared by name precisely because implicit
+        # inheritance across organisations is where Glassdocs lost a day, and a
+        # value that arrives implicitly is a value nobody can see arriving. The
+        # caller writes `cf-account-id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}` in its
+        # own diff.
+        #
+        # OPTIONAL, and empty falls back to the secret. See CF_ACCOUNT_ID below:
+        # every caller written before #81 forwards the secret and must keep
+        # deploying. tests/publisher/account-id.test.mjs pins the fallback.
+        description: "Cloudflare account id that owns the Pages project, as a plain input. Not a secret. Falls back to the CLOUDFLARE_ACCOUNT_ID secret when empty."
+        required: false
+        type: string
+        default: ""
+    # Declared BY NAME so a caller in a DIFFERENT GitHub org can map them
+    # explicitly: `secrets: inherit` only forwards within one org, and every
+    # external agency is a different org. Declared optional (not required) on
+    # purpose -- a not-yet-connected repo should reach the credential pre-flight
+    # and get a legible message, not a hard gate with no explanation.
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        description: "Cloudflare API token (Pages: Edit, and Access: Apps and Policies: Edit for gated sites)"
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        # RETAINED FOR THE MIGRATION, and it is the whole difficulty in #81. Every
+        # caller workflow generated before this change forwards this secret; a
+        # publisher that stopped reading it would break every existing client site
+        # on its next deploy, fleet-wide, from a step whose message names a
+        # missing credential. It is superseded by `cf-account-id` above, not
+        # replaced, and it is read in exactly one place.
+        description: "DEPRECATED, still honoured. Cloudflare account id as a secret; prefer the cf-account-id input, which the console can read back."
+        required: false
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════
+  # JOB 1 -- preflight. Holds the credential, runs nothing from the site repo.
+  #
+  # Deliberately does NOT check the site out. Everything here reads the caller's
+  # inputs and the agency's Cloudflare account, so a missing or under-scoped
+  # token is a sentence within twenty seconds rather than a wrangler error five
+  # minutes later. It runs in parallel with `build`, which has no credential and
+  # therefore cannot be gated on this without giving the credential a reason to
+  # exist on that runner.
+  # ═══════════════════════════════════════════════════════════════════════
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      MODE: ${{ inputs.mode }}
+      PROJECT_NAME: ${{ inputs.project-name }}
+      # THE TWO SOURCES OF THE ACCOUNT ID, RESOLVED ONCE PER JOB (issue #81).
+      #
+      # Ten steps need it. Ten copies of this expression is ten chances for one
+      # of them to go on reading the secret directly -- and that one would work
+      # perfectly on every repository that still has the secret and fail only on
+      # the ones that have moved on, which is the least findable bug available.
+      # So it is resolved here and every consumer reads env.
+      #
+      # ONCE PER JOB, not once per workflow, and that is forced rather than
+      # chosen (issue #148). The obvious tidier shape -- resolve it in `preflight`
+      # and pass it down as a job output -- does not work: GitHub redacts secrets
+      # from job outputs, so on every repository that still supplies the account
+      # id as `secrets.CLOUDFLARE_ACCOUNT_ID` the output would arrive EMPTY, and
+      # the deploy would fail on the repositories that had not migrated. That is
+      # the same least-findable failure #81 was about, one level up.
+      # account-id.test.mjs pins that every copy is byte-identical.
+      #
+      # THE INPUT WINS. An agency that has set the variable is telling us where
+      # they deploy in a place they can also read; a leftover secret from a
+      # previous connect must not shadow it, because the console shows the
+      # variable and a run using the other value would make the console wrong
+      # about the agency's own Cloudflare account.
+      #
+      # THE SECRET STILL ANSWERS. Empty input, secret set, is every site
+      # published before #81, and they keep deploying unchanged.
+      CF_ACCOUNT_ID: ${{ inputs.cf-account-id != '' && inputs.cf-account-id || secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      # ── 0. Inputs. No network, no side effects, nothing built yet. ────────
+      #
+      # The composite actions live beside this workflow in the publisher repo and
+      # are referenced as owner/repo/path@ref, which the runner resolves without
+      # a separate checkout.
+      #
+      # These say @main ON PURPOSE, and only in the source copy. A push to main
+      # has to be runnable end to end against the action scripts sitting beside
+      # it, or main is untestable. The RELEASED copy carries the pinned ref
+      # instead, so a caller pinned at @v1 gets v1's workflow orchestrating v1's
+      # actions and not main's -- a pinned reference that is not actually pinned
+      # is the failure this whole arrangement exists to prevent.
+      #
+      # That substitution is the `composite-actions` rewrite in
+      # .github/actions/_lib/release.mjs. It is asserted to match something on
+      # every CI run, so renaming an action surfaces as "the rewrite no longer
+      # applies" rather than as an undecodable diff. The source copy keeps
+      # owner/repo at the repository where the publisher is AUTHORED -- the
+      # `uses:` line below says which one -- and the released copy rewrites both
+      # halves to the public mirror at the pinned tag, so a caller on @v1 gets
+      # v1's workflow orchestrating v1's actions.
+      #
+      # NEITHER ADDRESS IS SPELLED OUT IN THIS COMMENT, ON PURPOSE (#239). It
+      # named both as literals, and both were wrong within a week: the authoring
+      # repo was transferred to another org on 2026-08-17, and the repository
+      # this comment called "the public mirror" was made PRIVATE the same day,
+      # having published the whole authoring tree since v1.8.0. Nothing went red
+      # for either, and the released copy carried the claim to the mirror where
+      # an agency reads it.
+      #
+      # A prose address is invisible to the rewrite rules, which only ever see a
+      # `uses:` line, and invisible to addressMoveExplains(), which waves a
+      # mirror move through with no version bump precisely because the released
+      # bytes are supposed to carry their own address. So a comment restating an
+      # address is a second copy of .github/publisher-release.json with no check
+      # on it. release-contract.test.mjs now refuses one.
+      #
+      # The one file that decides both is .github/publisher-release.json:
+      # `source` on the left of each rewrite, `distribution` on the right. See
+      # ARCHITECTURE.md "Distribution" and .github/RELEASING.md.
+      - name: Validate publisher inputs
+        uses: Rocket-Sites/rs-publisher/.github/actions/validate-inputs@v1
+        with:
+          mode: ${{ inputs.mode }}
+          project-name: ${{ inputs.project-name }}
+          agency-domain: ${{ inputs.agency-domain }}
+          client-domain: ${{ inputs.client-domain }}
+          client-emails: ${{ inputs.client-emails }}
+          custom-domain: ${{ inputs.custom-domain }}
+          # Issue #123: the only caller input that used to reach a third party
+          # without being validated. It becomes `npm install wrangler@<value>`
+          # in the job holding the Cloudflare token.
+          wrangler-version: ${{ inputs.wrangler-version }}
+
+      # ── 1. Credentials. Fail early and legibly, before any side effect. ───
+      - name: Cloudflare credential pre-flight
+        uses: Rocket-Sites/rs-publisher/.github/actions/check-credentials@v1
+        with:
+          mode: ${{ inputs.mode }}
+          cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cf-account-id: ${{ env.CF_ACCOUNT_ID }}
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # JOB 2 -- build. Runs the site repository's own code. Holds NO credential.
+  #
+  # THIS JOB CONTAINS NO `secrets.` EXPRESSION, AND THAT IS THE WHOLE POINT
+  # (issue #148, ARCHITECTURE.md invariant 14). GitHub places a secret on a
+  # runner only where an expression asks for one, so a job that asks for none
+  # never has one to steal -- from its environment, from another step's
+  # `/proc/<pid>/environ`, from `$GITHUB_ENV`, or from a poisoned
+  # `npm install` in the workspace. Adding one line of `${{ secrets.* }}` to
+  # this job reopens the chain in full, which is why a test refuses it rather
+  # than a comment asking people to remember.
+  #
+  # It is also the only job that checks the site repository out. Everything
+  # downstream receives the BUILT DIRECTORY as an artifact: bytes that have
+  # already been through the artifact guard, on a machine that never ran a line
+  # of the site's code.
+  # ═══════════════════════════════════════════════════════════════════════
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # The assembled upload directory. Never the repo root: the repo carries
+      # plumbing a client's visitors have no business receiving.
+      PUBLISH_DIR: _site
+
+    steps:
+      # ── Third-party actions are pinned BY SHA (issue #123) ───────────────
+      #
+      # A tag is a mutable pointer owned by whoever controls the upstream
+      # repository, so `@v4` and `@v3` mean "whatever that repository decides
+      # tomorrow" -- a compromise there, or of a maintainer account there,
+      # reaches every agency's runner with no action on our side and no signal
+      # that anything changed. A commit SHA cannot be moved by anyone.
+      #
+      # The publisher already applies this discipline where the stakes are
+      # lower: build-site pins the Tailwind CLI exactly, "so a Tailwind release
+      # cannot silently change every agency's published CSS on a Tuesday". A
+      # Tailwind release changing CSS got a pin; a wrangler-action release
+      # reading the token did not.
+      #
+      # The trailing comment is the version the SHA was at the time, because
+      # forty hex characters are unreadable and an unreadable pin is one nobody
+      # updates. release-contract.test.mjs enforces both halves.
+      - name: Check out site source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # ── 2. Build and guard the artifact. Still no side effects. ──────────
+      # Deliberately ahead of everything that mutates Cloudflare: a site that
+      # loads the Tailwind CDN, or whose pages cannot be resolved back to this
+      # repo, must fail before the Pages project is created and before a single
+      # byte is uploaded.
+      #
+      # This step is where `tailwind.config.cjs` from the client's repository is
+      # EXECUTED, by Tailwind, as Node. On this runner that is a build tool
+      # reading a config file. In the job below it would be arbitrary code beside
+      # an account-wide Cloudflare credential.
+      - name: Build and guard the site
+        uses: Rocket-Sites/rs-publisher/.github/actions/build-site@v1
+        with:
+          site-dir: "."
+          publish-dir: ${{ env.PUBLISH_DIR }}
+          repo: ${{ github.repository }}
+
+      # ── 2b. Hand the guarded bytes to the credentialed job. ──────────────
+      #
+      # The artifact is the seam. It carries files and nothing else: no
+      # environment, no processes, no PATH, no workspace the next job's
+      # `npm install` will read. The publish job below reconstructs this
+      # directory and uploads it without ever having seen the repository it came
+      # from.
+      #
+      # `include-hidden-files: true` is load-bearing, not tidiness. The default
+      # since upload-artifact v4.4 is to DROP dotfiles with a warning, and
+      # `/.well-known/` is an ordinary thing on a marketing site -- domain
+      # verification, `security.txt`, an app-site association file. Silently
+      # losing it would break exactly the launch-day task nobody re-checks.
+      # The rsync deny-list in build-site is what decides which dotfiles reach
+      # the artifact at all; this must not become a second, quieter filter.
+      #
+      # `if-no-files-found: error` because an empty artifact would sail through
+      # the download below and deploy a client's site as nothing at all.
+      - name: Hand the built site to the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rocket-site
+          path: ${{ env.PUBLISH_DIR }}
+          include-hidden-files: true
+          if-no-files-found: error
+          # A handoff inside one run, not a record. It exists for the length of
+          # the deploy; the site's durable copy is the repository it was built
+          # from.
+          retention-days: 1
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # JOB 3 -- publish. Holds CLOUDFLARE_API_TOKEN. Runs no site-supplied code.
+  #
+  # There is no `actions/checkout` in this job and there must never be one. The
+  # site repository is not present on this runner: the only thing from the
+  # client that exists here is the built directory, downloaded as data and
+  # uploaded to Pages as data. `npm install wrangler@...` therefore runs in a
+  # workspace with no `package.json` and no `.npmrc` for the site to have
+  # written.
+  # ═══════════════════════════════════════════════════════════════════════
+  publish:
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+    env:
+      # Env-indirection for every attacker-influenceable value. These inputs come
+      # straight from an agency repo variable set by a human or by the extension,
+      # with no server-side validation in front of them, and this runner holds
+      # the agency's most powerful Cloudflare credential. Passed as $VARS, the
+      # values are data; inlined as ${{ }} into a run: body, bash would
+      # re-evaluate them.
+      PROJECT_NAME: ${{ inputs.project-name }}
+      MODE: ${{ inputs.mode }}
+      # Byte-identical to the resolution in `preflight` above, which carries the
+      # reasoning. A job output cannot carry it: GitHub redacts secrets from
+      # those, so the fallback for every un-migrated repository would arrive
+      # empty (issue #148).
+      CF_ACCOUNT_ID: ${{ inputs.cf-account-id != '' && inputs.cf-account-id || secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PUBLISH_DIR: _site
+
+    steps:
+      # ── 2c. Reconstruct the guarded artifact. ────────────────────────────
+      #
+      # Into `_site`, deliberately, and not into the workspace root: the root is
+      # what `npm install wrangler@<version>` reads a package manifest from, and
+      # it must stay empty.
+      - name: Take the built site from the build job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rocket-site
+          path: ${{ env.PUBLISH_DIR }}
+
+      # ── 3. Pages project. Records `created` -- see the action's comment. ──
+      - name: Ensure Pages project (direct upload)
+        id: ensure-project
+        uses: Rocket-Sites/rs-publisher/.github/actions/ensure-project@v1
+        with:
+          project-name: ${{ inputs.project-name }}
+          cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cf-account-id: ${{ env.CF_ACCOUNT_ID }}
+
+      # ── 4. GATED: the gate goes up BEFORE any content is uploaded. ───────
+      #
+      # Deliberately after the project exists and before the deploy. Glassdocs
+      # attempts the Access app first, discovers the Pages project does not exist
+      # yet, and defers app creation until AFTER the first deploy -- which leaves
+      # a window in which fresh content is live and ungated. Creating the project
+      # first removes that window entirely: the project exists (serving nothing),
+      # the gate goes up over its real subdomain, and only then is any byte of a
+      # site under review uploaded. If the gate cannot be created, this step
+      # fails and nothing is published, which is the whole point of gated mode.
+      #
+      # This step is also where a custom domain on a gated project is refused
+      # (invariant 10): an Access app covers the hosts it names, so a project
+      # answering on client.com cannot be proven gated by a 302 on pages.dev.
+      - name: Ensure Cloudflare Access gate
+        id: gate
+        if: ${{ inputs.mode == 'gated' }}
+        uses: Rocket-Sites/rs-publisher/.github/actions/ensure-access-app@v1
+        with:
+          project-name: ${{ inputs.project-name }}
+          cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cf-account-id: ${{ env.CF_ACCOUNT_ID }}
+
+      # ── 4b. PUBLIC: drop any gate left over from the review period. ──────
+      # `mode: public` -- stated or defaulted -- means this site is meant to be
+      # found. An Access app still covering the domain would silently defeat
+      # that, and the client is paying for the site to be findable. A caller that
+      # still wants the gate says so, and validate-inputs refuses the middle
+      # ground where `public` arrives alongside access inputs. Best effort:
+      # a token with no Access scope can only warn here, and the post-deploy
+      # proof below is the backstop that actually decides.
+      - name: Remove any leftover Access gate
+        id: ungate
+        if: ${{ inputs.mode == 'public' }}
+        uses: Rocket-Sites/rs-publisher/.github/actions/remove-access-gate@v1
+        with:
+          project-name: ${{ inputs.project-name }}
+          cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cf-account-id: ${{ env.CF_ACCOUNT_ID }}
+
+      # ── 5. GATED: reconcile who is allowed through the gate. ─────────────
+      - name: Sync Access policies
+        if: ${{ inputs.mode == 'gated' }}
+        uses: Rocket-Sites/rs-publisher/.github/actions/sync-access-policies@v1
+        with:
+          app-id: ${{ steps.gate.outputs.app-id }}
+          cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cf-account-id: ${{ env.CF_ACCOUNT_ID }}
+          agency-domain: ${{ inputs.agency-domain }}
+          client-domain: ${{ inputs.client-domain }}
+          client-emails: ${{ inputs.client-emails }}
+
+      # ── 5b. Stamp the site's OWN url, and emit robots.txt + sitemap.xml. ─
+      #
+      # The last thing that touches the artifact, and still before the upload.
+      # It has to be here rather than in `build-site` because the canonical host
+      # is the project's real .subdomain or a custom domain attached to it, and
+      # on a first deploy neither exists until step 3 has run. Guessing
+      # `<project>.pages.dev` is the guess _lib/domain.mjs exists to refuse: on a
+      # global pages.dev name collision that host belongs to a DIFFERENT
+      # Cloudflare account, so the guess would point a client's canonical at a
+      # stranger's website.
+      #
+      # A site that reaches this step with a canonical on example.com is
+      # CORRECTED, not merely reported -- the published bytes are always right,
+      # exactly as with the source-repo meta. The guard inside the action is a
+      # second process re-reading the artifact, so a placeholder somewhere the
+      # rewriter does not reach still fails the publish with nothing uploaded.
+      - name: Stamp the site URL and crawl posture
+        id: site-url
+        uses: Rocket-Sites/rs-publisher/.github/actions/stamp-site-url@v1
+        with:
+          mode: ${{ inputs.mode }}
+          project-name: ${{ inputs.project-name }}
+          publish-dir: ${{ env.PUBLISH_DIR }}
+          custom-domain: ${{ inputs.custom-domain }}
+          cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cf-account-id: ${{ env.CF_ACCOUNT_ID }}
+
+      # ── 6. Upload. ───────────────────────────────────────────────────────
+      # project-name is interpolated into wrangler's command line, which is why
+      # step 0 rejects anything outside [a-z0-9-] before this point.
+      #
+      # THIS is the step that receives the Cloudflare API token, so it is the
+      # one the SHA pin above matters most for. Note that wrangler-action then
+      # runs `npm install wrangler@<version>` at deploy time, which is a floating
+      # npm dependency executing in the same job -- pinning the action does not
+      # pin that, and `wrangler-version` is validated in step 0 so the value
+      # reaching that install is a semver or nothing.
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.CF_ACCOUNT_ID }}
+          wranglerVersion: ${{ inputs.wrangler-version }}
+          # Force npm. Otherwise wrangler-action infers the package manager from
+          # a lockfile in the site repo and fails on a runner that has no pnpm.
+          packageManager: npm
+          command: pages deploy ${{ env.PUBLISH_DIR }} --project-name=${{ inputs.project-name }}
+
+      # ── 7. Post-deploy proof. ────────────────────────────────────────────
+      #
+      # Both guards are load-bearing.
+      #
+      # `!cancelled()` -- in gated mode, if something between the deploy and here
+      # fails, content is live and the gate may not be. A step that only ran on
+      # job success would skip verification precisely then.
+      #
+      # `steps.deploy.outcome == 'success'` -- a build or upload failure published
+      # nothing, so it must never trigger a rollback of a prior good deployment.
+      #
+      # The two steps are one action driven by `mode`, so the seam between the
+      # branches is a single decision a test can read rather than two files that
+      # drift apart.
+
+      - name: Post-deploy proof (gated -- must redirect)
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' && inputs.mode == 'gated' }}
+        uses: Rocket-Sites/rs-publisher/.github/actions/post-deploy-verify@v1
+        with:
+          # ONE source for this fact (issue #103). This used to be the literal
+          # `gated`, independent of the `if:` above, and nothing reconciled the
+          # two: swapping this one token ran the PUBLIC proof over a correctly
+          # gated site, which classifies it PROVEN LOCKED and DELETES THE ACCESS
+          # APP of an unlaunched client site -- with all 205 tests green. The
+          # step's guard already decides which branch runs, so the action is
+          # handed the same value it was selected on rather than told twice.
+          mode: ${{ inputs.mode }}
+          project-name: ${{ inputs.project-name }}
+          repo: ${{ github.repository }}
+          domain: ${{ steps.gate.outputs.domain }}
+          # Exact, and sourced only from the step that created the project. This
+          # is the sole permission to delete a Pages project anywhere in the
+          # publisher; inferring it from any other signal would turn a failed
+          # check into an agency's outage.
+          project-created-here: ${{ steps.ensure-project.outputs.created }}
+          cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cf-account-id: ${{ env.CF_ACCOUNT_ID }}
+
+      - name: Post-deploy proof (public -- must serve this site)
+        if: ${{ !cancelled() && steps.deploy.outcome == 'success' && inputs.mode == 'public' }}
+        uses: Rocket-Sites/rs-publisher/.github/actions/post-deploy-verify@v1
+        with:
+          # See the gated proof above: the guard is the one source of the mode.
+          mode: ${{ inputs.mode }}
+          project-name: ${{ inputs.project-name }}
+          repo: ${{ github.repository }}
+          domain: ${{ steps.ungate.outputs.domain }}
+          # Invariant 11. Discovery runs regardless; passing the declaration lets
+          # the proof fail on a contradiction rather than quietly proving the
+          # wrong host. Every domain the project serves must carry this repo's
+          # source-repo meta, because nobody visits a pages.dev address.
+          custom-domain: ${{ inputs.custom-domain }}
+          # project-created-here is deliberately NOT passed in public mode.
+          # Deleting the project is a gated-only corrective action, and there is
+          # no public-mode failure it could possibly repair.
+          cf-api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          cf-account-id: ${{ env.CF_ACCOUNT_ID }}
+
+      # ── 8. Publish the address, for readers who are not this run. ────────
+      #
+      # ARCHITECTURE.md invariant 12. This run is the only party that ever knows
+      # where the site ended up: the canonical host comes from the Pages
+      # project's real `.subdomain` or an attached custom domain, resolved at
+      # step 5b and PROVEN at step 7. Until this step existed the publisher
+      # computed that answer, stamped it into the bytes, and dropped it, so the
+      # fleet console had nothing to report but "Address not known" for a live,
+      # healthy site.
+      #
+      # THE STEP NAME IS THE MACHINE-READABLE CONTRACT, and the shape is dictated
+      # by what a reader can actually reach rather than by taste:
+      #
+      #   * The console reads it from `GET /actions/runs/{id}/jobs`, which
+      #     returns every step's rendered name. That endpoint needs `Actions:
+      #     read`, which the Rocket Sites GitHub App already holds.
+      #   * A GitHub Deployment carrying `environment_url` is the semantically
+      #     correct home for this and was the first choice. It needs
+      #     `Deployments: read`, which the App does NOT hold: the installation
+      #     token gets 403 on `GET /repos/{o}/{r}/deployments`, measured, not
+      #     assumed. Adding a permission re-prompts every installed org, so it is
+      #     a decision for a human, recorded in ARCHITECTURE.md next to
+      #     invariant 12 rather than taken here.
+      #   * A `::notice::` annotation is readable only through the check-runs
+      #     annotations API, which needs `Checks: read`. Also 403.
+      #   * `$GITHUB_STEP_SUMMARY` has no REST API at all, so nothing off the
+      #     runner can read it. It is written below anyway, because it is the
+      #     best surface for the HUMAN opening the run, and it costs three lines.
+      #
+      # Guarded on `success()`, deliberately. An address is a claim about where
+      # a site is serving, and this publisher does not report success on an
+      # unproven state (invariant 2). If the post-deploy proof failed, no address
+      # is published, the console keeps the last proven one, and a site whose
+      # address was never proven reads "Address not known" exactly as before.
+      #
+      # Never `<project-name>.pages.dev`. That namespace is global; on a
+      # collision the plain name resolves to a DIFFERENT Cloudflare account, and
+      # a link built from it sends an agency to a stranger's website under their
+      # client's name. It has already happened to a site in this fleet.
+      - name: Site address ${{ steps.site-url.outputs.canonical-origin }}
+        if: ${{ success() && steps.site-url.outputs.canonical-origin != '' }}
+        env:
+          SITE_ADDRESS: ${{ steps.site-url.outputs.canonical-origin }}
+          SERVING_DOMAINS: ${{ steps.site-url.outputs.serving-domains }}
+        run: |
+          printf 'Site address %s\n' "$SITE_ADDRESS"
+          printf 'Answering on %s\n' "$SERVING_DOMAINS"
+          {
+            printf '## Site address\n\n'
+            printf 'This deploy is serving at %s\n\n' "$SITE_ADDRESS"
+            printf 'Every host this Pages project answers on: `%s`\n' "$SERVING_DOMAINS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 8b. And record it where it does not expire. ──────────────────────
+      #
+      # ARCHITECTURE.md invariant 12, issue #163. The step name above is read out
+      # of the run's LOG, and a repository's log-retention setting deletes it --
+      # 90 days by default. So a client site that has not deployed for a quarter
+      # lost its address and the console said "Address not known" about a live,
+      # healthy site. `environment_url` on a GitHub Deployment is the field
+      # GitHub provides for exactly this, and a Deployment is a permanent
+      # repository object.
+      #
+      # THE TWO ARE RANKED, NOT MERGED. The console prefers the Deployment for
+      # the canonical address and falls back to the step name for a run that
+      # predates this or a caller whose token could not write one. Both are read
+      # off the SAME RUN -- the deployment names its run id, and the console only
+      # trusts a run GitHub reports as having called this publisher -- so they
+      # cannot disagree about where a client's site is. The serving SET (step 9)
+      # stays a step name: a Deployment carries one environment_url, and that is
+      # the canonical host.
+      #
+      # WRITTEN WITH THE CALLER'S OWN GITHUB_TOKEN, and that is the design
+      # decision, not an implementation detail. The Rocket Sites App holds
+      # `deployments: write` and is being narrowed to `read` because nothing
+      # consumes the write half (#67, #84). An App installation token writing
+      # this would make that narrowing impossible, and would put a Rocket Lab
+      # credential inside an agency's deploy -- which hard rule 1 exists to
+      # prevent. The publish job has declared `deployments: write` since the
+      # first release and every scaffolded caller grants it, so this needs no
+      # edit in any existing site repository.
+      #
+      # Guarded on success() for the reason step 8 is, and it bites harder here:
+      # a step name expires, a Deployment does not, so an address recorded before
+      # the proof would be a confident wrong answer with a permanent record
+      # behind it. Nothing here can fail the run: the site is deployed and proven
+      # by this point, and a caller whose default token permissions are read-only
+      # is a state we cannot see in advance and must not turn into a red build.
+      - name: Record the address as a GitHub Deployment
+        if: ${{ success() && steps.site-url.outputs.canonical-origin != '' }}
+        uses: Rocket-Sites/rs-publisher/.github/actions/record-deployment@v1
+        with:
+          address: ${{ steps.site-url.outputs.canonical-origin }}
+          repo: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          run-sha: ${{ github.sha }}
+          github-token: ${{ github.token }}
+
+      # ── 9. Publish the WHOLE serving set, for the same readers. ──────────
+      #
+      # ARCHITECTURE.md invariant 11, issue #61. Step 8 publishes the ONE host
+      # that is canonical; this publishes every host the project answers on,
+      # which is a different fact and the one nothing off the runner could see.
+      #
+      # Why a second step and not a longer name on step 8: the step NAME is the
+      # machine-readable contract, and one step has one name. Two facts jammed
+      # into one string is a parser with a delimiter in it, which is how the two
+      # ends drift.
+      #
+      # WHAT THIS BUYS, precisely. The console reads the caller workflow, so it
+      # already knows what a repository DECLARES. It has never been able to see
+      # what Cloudflare actually serves, because that is an account fact and the
+      # control plane holds no Cloudflare credential by design. The gap between
+      # the two is the product: a domain attached in the dashboard that nothing
+      # declares passes this deploy (invariant 11 warns and carries on, because
+      # an attached domain is still a domain the site is served at) and is
+      # invisible from every other angle. The other three mismatch shapes fail
+      # the run and are legible from its failure; this one does not.
+      #
+      # Guarded on success() for the same reason step 8 is, and it matters more
+      # here rather than less: the set is resolved at step 5b, BEFORE the proof,
+      # so an unguarded step would publish a discovery as though it were a
+      # proof. What this step means is "every host this run PROVED is serving
+      # this site". A run that failed proved nothing, publishes nothing, and the
+      # console keeps the last proven set and says when it was proven.
+      #
+      # Nothing here attaches a domain and nothing here writes DNS. The
+      # publisher does not (invariant 11) and the console cannot: it holds no
+      # Cloudflare credential at all.
+      - name: Serving domains ${{ steps.site-url.outputs.serving-domains }}
+        if: ${{ success() && steps.site-url.outputs.serving-domains != '' }}
+        env:
+          SERVING_DOMAINS: ${{ steps.site-url.outputs.serving-domains }}
+        run: |
+          printf 'Serving domains %s\n' "$SERVING_DOMAINS"
