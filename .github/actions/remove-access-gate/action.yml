@@ -1,0 +1,34 @@
+name: Remove any Access gate (public mode)
+description: |
+  PUBLIC MODE ONLY. Resolve the domain and delete any Cloudflare Access app
+  gating it, before the deploy. Best effort: a token with no Access scope can
+  only warn, and the post-deploy check is the backstop.
+
+  This action never rolls back a deployment and never deletes a Pages project.
+
+inputs:
+  project-name:
+    description: Cloudflare Pages project name
+    required: true
+  cf-api-token:
+    description: Cloudflare API token
+    required: true
+  cf-account-id:
+    description: Cloudflare account id
+    required: true
+
+outputs:
+  domain:
+    description: The domain the site is really served at
+    value: ${{ steps.run.outputs.domain }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        PROJECT_NAME: ${{ inputs.project-name }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cf-api-token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cf-account-id }}
+      run: node "${{ github.action_path }}/remove-access-gate.mjs"
