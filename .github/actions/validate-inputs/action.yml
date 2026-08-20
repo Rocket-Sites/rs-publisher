@@ -1,0 +1,67 @@
+name: Validate publisher inputs
+description: |
+  Fail early and legibly on a publication mode that is not exactly `public` or
+  `gated`, on a malformed Cloudflare Pages project name, and on a caller that
+  asks for `public` while also passing Access inputs.
+
+  Runs before the build and before any Cloudflare call, so a caller mistake can
+  never be discovered halfway through a publish.
+
+inputs:
+  mode:
+    description: |
+      public | gated. The workflow_call input defaults to `public`, so by the
+      time this runs the value is always present. An EMPTY value still fails
+      here: it means the caller passed an unset variable while believing it
+      chose the mode (ARCHITECTURE.md invariant 5).
+    required: true
+  project-name:
+    description: Cloudflare Pages project name
+    required: true
+  agency-domain:
+    description: Agency staff email domain (gated mode only)
+    required: false
+    default: ""
+  client-domain:
+    description: Client email domain (gated mode only)
+    required: false
+    default: ""
+  client-emails:
+    description: Comma or newline separated client emails (gated mode only)
+    required: false
+    default: ""
+  custom-domain:
+    description: |
+      Optional bare hostname the site is canonically served at. Refused in gated
+      mode: an Access app covers only the hosts it names (invariant 10).
+    required: false
+    default: ""
+  wrangler-version:
+    description: |
+      Optional exact Wrangler version, or empty. This is the value
+      cloudflare/wrangler-action interpolates into `npm install wrangler@...` in
+      the job that holds the agency's Cloudflare API token, which makes it an npm
+      specifier; it was the only caller input that reached a third party without
+      passing through this step (issue #123).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      # SECURITY: every one of these values is attacker-influenceable -- they
+      # come from an agency repo variable that any org member with write access
+      # can set, with no server-side validation in front of them. They reach the
+      # script through env only, never inlined as ${{ }} into a run: body, because
+      # bash re-evaluates inlined interpolation and this runner holds the agency's
+      # Cloudflare credential.
+      env:
+        MODE: ${{ inputs.mode }}
+        PROJECT_NAME: ${{ inputs.project-name }}
+        AGENCY_DOMAIN: ${{ inputs.agency-domain }}
+        CLIENT_DOMAIN: ${{ inputs.client-domain }}
+        CLIENT_EMAILS: ${{ inputs.client-emails }}
+        CUSTOM_DOMAIN: ${{ inputs.custom-domain }}
+        WRANGLER_VERSION: ${{ inputs.wrangler-version }}
+      run: node "${{ github.action_path }}/validate-inputs.mjs"

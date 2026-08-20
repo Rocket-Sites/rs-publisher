@@ -1,0 +1,50 @@
+name: Sync Cloudflare Access policies
+description: |
+  GATED MODE ONLY. Recreate the managed allow policy on an Access app from the
+  declared inputs and remove the pre-existing ones, creating first so the app is
+  never left with zero policies.
+
+  With no valid grants the policy matches nobody, a warning says so in those
+  words, and the deploy still succeeds: for an unlaunched client site, gated to
+  nobody is the safe direction. It never falls back to public.
+
+  There is no default grant. An empty agency-domain grants nothing.
+
+inputs:
+  app-id:
+    description: Cloudflare Access application id
+    required: true
+  cf-api-token:
+    description: Cloudflare API token
+    required: true
+  cf-account-id:
+    description: Cloudflare account id
+    required: true
+  agency-domain:
+    description: "Agency staff email domain. Empty means no domain-level grant -- there is no fallback."
+    required: false
+    default: ""
+  client-domain:
+    description: Client email domain
+    required: false
+    default: ""
+  client-emails:
+    description: Comma or newline separated client email addresses
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      # Every value here is attacker-influenceable and reaches the script through
+      # env only. A crafted address stays data rather than becoming code on a
+      # runner that holds the agency's Cloudflare token.
+      env:
+        APP_ID: ${{ inputs.app-id }}
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cf-api-token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cf-account-id }}
+        AGENCY_DOMAIN: ${{ inputs.agency-domain }}
+        CLIENT_DOMAIN: ${{ inputs.client-domain }}
+        CLIENT_EMAILS: ${{ inputs.client-emails }}
+      run: node "${{ github.action_path }}/sync-access-policies.mjs"
